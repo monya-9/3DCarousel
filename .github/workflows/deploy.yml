@@ -1,0 +1,113 @@
+name: Deploy Project
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-northeast-2
+  S3_BUCKET: sandwich-user-projects
+  USER_ID: ${{ secrets.USER_ID }}
+  PROJECT_ID: ${{ secrets.PROJECT_ID }}
+  ECS_CONTAINER_NAME: "app-container"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.SANDWICH_USER_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SANDWICH_USER_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ===========================
+      # ✅ 프론트엔드 빌드/배포 (package.json 존재 시)
+      # ===========================
+      - name: Build frontend if exists
+        run: |
+          if [ -f package.json ]; then
+            echo "package.json detected — building frontend..."
+            npm install
+            npm run build
+            echo "Build complete. Checking build folder:"
+            ls -la build || echo "build 폴더가 없습니다"
+          else
+            echo "No package.json — skipping frontend build"
+          fi
+        continue-on-error: true
+
+      - name: Deploy frontend to S3
+        run: |
+          if [ -d build ]; then
+            echo "Deploying frontend to S3..."
+            aws s3 sync build/ s3://${{ env.S3_BUCKET }}/${{ env.USER_ID }}/${{ env.PROJECT_ID }} --acl public-read
+            aws cloudfront create-invalidation               --distribution-id ${{ secrets.SANDWICH_USER_CLOUDFRONT_DISTRIBUTION_ID }}               --paths "/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/*"
+          else
+            echo "No build folder — skipping S3 deployment"
+          fi
+        continue-on-error: true
+
+      # ===========================
+      # ✅ 백엔드 ECS 배포 (Dockerfile 존재 시)
+      # ===========================
+      - name: Login to Amazon ECR
+        if: ${{ hashFiles('Dockerfile') != '' }}
+        uses: aws-actions/amazon-ecr-login@v2
+        continue-on-error: true
+
+      - name: Create ECR repository if not exists
+        if: ${{ hashFiles('Dockerfile') != '' }}
+        run: |
+          aws ecr describe-repositories --repository-names "sandwich-user-projects/${{ env.USER_ID }}-${{ env.PROJECT_ID }}" ||           aws ecr create-repository --repository-name "sandwich-user-projects/${{ env.USER_ID }}-${{ env.PROJECT_ID }}"
+        continue-on-error: true
+
+      - name: Build and Push Docker image
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "Dockerfile detected — building backend image..."
+            IMAGE_TAG=${GITHUB_SHA}
+            ECR_URI=398808282696.dkr.ecr.ap-northeast-2.amazonaws.com/sandwich-user-projects/${{ env.USER_ID }}-${{ env.PROJECT_ID }}
+            docker build -t $ECR_URI:$IMAGE_TAG .
+            docker push $ECR_URI:$IMAGE_TAG
+            docker tag $ECR_URI:$IMAGE_TAG $ECR_URI:latest
+            docker push $ECR_URI:latest
+            echo "[{\"name\": \"${{ env.ECS_CONTAINER_NAME }}\", \"imageUri\": \"$ECR_URI:$IMAGE_TAG\"}]" > imagedefinitions.json
+          else
+            echo "No Dockerfile — skipping backend build"
+          fi
+        continue-on-error: true
+
+      - name: Create ECS Cluster
+        if: ${{ hashFiles('Dockerfile') != '' }}
+        run: |
+          aws ecs create-cluster --cluster-name sandwich-${{ github.repository_owner }}-${{ github.event.repository.name }} || true
+        continue-on-error: true
+
+      - name: Create ECS Service
+        if: ${{ hashFiles('Dockerfile') != '' }}
+        run: |
+          aws ecs create-service             --cluster sandwich-${{ github.repository_owner }}-${{ github.event.repository.name }}             --service-name sandwich-${{ github.repository_owner }}-${{ github.event.repository.name }}             --task-definition sandwich-${{ github.repository_owner }}-${{ github.event.repository.name }}             --desired-count 1             --launch-type FARGATE             --network-configuration "awsvpcConfiguration={subnets=[subnet-0c63ddf51361003c7],securityGroups=[sg-05757f4e3849d99cf],assignPublicIp=ENABLED}" || true
+        continue-on-error: true
+
+      # ===========================
+      # ✅ 추가 파일 (있을 경우만)
+      # ===========================
+      - name: Download additional files from S3
+        run: |
+          ADDITIONAL_FILES=$(aws s3 ls s3://sandwich-user-projects/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/deploy/ --recursive | awk '{print $4}')
+          if [ -z "$ADDITIONAL_FILES" ]; then
+            echo "No additional files found."
+          else
+            mkdir -p additional
+            for file in $ADDITIONAL_FILES; do
+              echo "Downloading $file..."
+              aws s3 cp s3://sandwich-user-projects/${{ env.USER_ID }}/${{ env.PROJECT_ID }}/deploy/$file additional/$file
+            done
+          fi
+        continue-on-error: true
